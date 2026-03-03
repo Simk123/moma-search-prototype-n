@@ -18,3 +18,4 @@ View your app in AI Studio: https://ai.studio/apps/8b3d53e2-3a4d-4949-9f68-5d58f
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+# MoMA Search Prototype
