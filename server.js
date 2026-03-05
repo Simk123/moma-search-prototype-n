@@ -67,42 +67,35 @@ function getRelatedTerms(query) {
 function searchItems(query, limit = 30) {
   const q = query.toLowerCase().trim();
   const related = getRelatedTerms(query);
-  const allTerms = [q, ...related];
 
-  // Score every item
   const scored = ALL_ITEMS.map(item => {
-    const title = (item.title ?? "").toLowerCase();
+    const title   = (item.title   ?? "").toLowerCase();
     const summary = (item.summary ?? "").toLowerCase();
     const content = (item.content ?? "").toLowerCase();
 
     let score = 0;
 
-    // Exact query matches score highest
-    if (title.includes(q)) score += 10;
+    if (title.includes(q))   score += 10;
     if (summary.includes(q)) score += 5;
     if (content.includes(q)) score += 3;
 
-    // Related term matches score lower
     for (const term of related) {
-      if (title.includes(term)) score += 3;
+      if (title.includes(term))   score += 3;
       if (summary.includes(term)) score += 2;
       if (content.includes(term)) score += 1;
     }
 
-    // Bonus for having a real image
     if (item.image_url && item.image_url.trim() !== "") score += 2;
 
     return { ...item, _score: score };
   });
 
-  // Filter to items with any match, sort by score
   const matches = scored
     .filter(item => item._score > 0)
     .sort((a, b) => b._score - a._score)
     .slice(0, limit)
     .map(({ _score, ...item }) => item);
 
-  // If we have fewer than 6 results with images, pad with image-rich items
   const withImages = matches.filter(r => r.image_url && r.image_url.trim() !== "");
   if (withImages.length < 6) {
     const existingIds = new Set(matches.map(r => r.id));
@@ -132,24 +125,23 @@ app.get("/search/editorial", async (req, res) => {
   try {
     // 1. Search the full JSON dataset
     const results = searchItems(query, 30);
-    const topScore = results.length > 0 ? 1 : 0; // if anything returned, we have matches
 
     // 2. Separate image pool for fallback
     const imagePool = results.filter(r => r.image_url && r.image_url.trim() !== "");
 
     console.log(`Query: "${query}" | Results: ${results.length} | With images: ${imagePool.length}`);
 
-    // 3. Build prompt context
+    // 3. Build prompt context — keep it small to avoid Haiku JSON corruption
     const resultsContext = results.length === 0
       ? `NOTE: No matching records found for "${query}" in the MoMA dataset.
 Generate accurate editorial content about "${query}" from your knowledge of MoMA's collection and art history.
 Set ALL image_url fields to null.`
       : `SEARCH RESULTS (sorted by relevance):
-${JSON.stringify(results.slice(0, 20).map(r => ({
+${JSON.stringify(results.slice(0, 12).map(r => ({
   id: r.id,
   type: r.type,
   title: r.title,
-  summary: r.summary?.slice(0, 80) || "",
+  summary: r.summary?.slice(0, 40) || "",
   image_url: r.image_url || null,
 })), null, 2)}`;
 
@@ -161,21 +153,21 @@ ${resultsContext}
 
 LAYOUT TYPE — pick exactly one:
 - "artist"     → query is a specific person's name (e.g. "Cindy Sherman", "Van Gogh", "Lee Krasner")
-- "exhibition" → query is about a specific exhibition or event (e.g. "Femme Camp", "Our Selves", "summer show")
-- "general"    → query is a theme, movement, medium, or broad topic (e.g. "women photographers", "fauvism", "abstract art")
+- "exhibition" → query is about a specific exhibition or event (e.g. "Femme Camp", "Our Selves")
+- "general"    → query is a theme, movement, medium, or broad topic (e.g. "women photographers", "fauvism", "time")
 
-CRITICAL FIELD RULES:
-- overview: 2-3 sentences directly relevant to "${query}"
-- artists: up to 4 items — each { id, type: "Artist", title, summary (max 20 words), image_url }
-- articles: up to 9 items — each { id, type: "Article", title, summary (max 20 words), image_url }
-- thematic_explorations: exactly 3 items — each { title (max 5 words), description (max 20 words), count }
-- history: exactly 4 items — each { period (max 5 words), description (max 20 words) }
-- on_view: exactly 3 items — each { floor (number only), description (max 10 words), count }
-- image_url: ONLY use values from the search results above. NEVER invent URLs. Set null if not available.
+FIELD RULES:
+- overview: 2-3 sentences relevant to "${query}"
+- artists: up to 3 items — each { id, type: "Artist", title, summary (max 10 words), image_url }
+- articles: up to 6 items — each { id, type: "Article", title, summary (max 10 words), image_url }
+- thematic_explorations: exactly 3 items — each { title (max 4 words), description (max 12 words), count }
+- history: exactly 3 items — each { period (max 4 words), description (max 12 words) }
+- on_view: exactly 3 items — each { floor (number only), description (max 8 words), count }
+- image_url: ONLY use values from the search results above. NEVER invent URLs. Set null if unavailable.
 
-Return ONLY valid JSON, no markdown, no code fences:
+Return this exact shape:
 {
-  "layout_type": "artist",
+  "layout_type": "general",
   "overview": "string",
   "artists": [],
   "articles": [],
@@ -184,11 +176,13 @@ Return ONLY valid JSON, no markdown, no code fences:
   "on_view": []
 }`;
 
-    // 4. Call Claude with timeout
+    // 4. Call Claude with system prompt + reduced max_tokens
     const message = await Promise.race([
       anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 2048,
+        max_tokens: 1500,
+        stream: false,   // ← add this
+        system: "You are a JSON API. Output ONLY raw valid JSON...",
         messages: [{ role: "user", content: prompt }],
       }),
       new Promise((_, reject) =>
@@ -197,18 +191,19 @@ Return ONLY valid JSON, no markdown, no code fences:
     ]);
 
     const text = message.content.find((b) => b.type === "text")?.text ?? "";
-    // Strip any markdown fences robustly
-    const clean = text
+
+    // Strip markdown fences just in case
+    const stripped = text
       .replace(/^\s*```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")
       .trim();
-    
-    // Find the JSON object boundaries as a last resort
-    const jsonStart = clean.indexOf("{");
-    const jsonEnd = clean.lastIndexOf("}");
-    const jsonStr = (jsonStart !== -1 && jsonEnd !== -1) 
-      ? clean.slice(jsonStart, jsonEnd + 1)
-      : clean;
+
+    // Extract JSON object boundaries as last resort
+    const jsonStart = stripped.indexOf("{");
+    const jsonEnd   = stripped.lastIndexOf("}");
+    const jsonStr   = (jsonStart !== -1 && jsonEnd !== -1)
+      ? stripped.slice(jsonStart, jsonEnd + 1)
+      : stripped;
 
     let data;
     try {
@@ -218,8 +213,7 @@ Return ONLY valid JSON, no markdown, no code fences:
       return res.status(500).json({ error: "Failed to parse Claude response" });
     }
 
-    // 5. Ignore Claude's image choices — assign directly from shuffled pool
-    //    to guarantee uniqueness and prevent the same image repeating.
+    // 5. Assign real images from shuffled pool (ignore Claude's image choices)
     const shuffled = [...imagePool].sort(() => Math.random() - 0.5);
     let imgIdx = 0;
     const nextImage = () => {
@@ -229,15 +223,8 @@ Return ONLY valid JSON, no markdown, no code fences:
       return img;
     };
 
-    // Assign a unique image to every article and artist
-    data.articles = (data.articles ?? []).map(item => ({
-      ...item,
-      image_url: nextImage(),
-    }));
-    data.artists = (data.artists ?? []).map(item => ({
-      ...item,
-      image_url: nextImage(),
-    }));
+    data.articles = (data.articles ?? []).map(item => ({ ...item, image_url: nextImage() }));
+    data.artists  = (data.artists  ?? []).map(item => ({ ...item, image_url: nextImage() }));
 
     return res.json(data);
   } catch (e) {
